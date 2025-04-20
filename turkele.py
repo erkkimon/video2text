@@ -18,8 +18,8 @@ model_dtype = next(model.parameters()).dtype
 processor = AutoProcessor.from_pretrained("huihui-ai/Qwen2.5-VL-3B-Instruct-abliterated")
 
 # Define paths and prompt
-video_path = "/home/erkkimon/Git/ComfyUI-Florence2/temp/big-buck-bunny-33s.mp4"
-output_path = "/home/erkkimon/Git/ComfyUI-Florence2/temp/big-buck-bunny-33s.txt"
+video_path = "temp/big-buck-bunny-33s.mp4"
+output_path = "temp/big-buck-bunny-33s.txt"
 prompt = "Describe this video."
 
 # Prepare the messages
