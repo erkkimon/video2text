@@ -8,6 +8,7 @@ import torch
 import cv2
 import requests
 import argparse
+import re
 from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoProcessor, LlavaForConditionalGeneration
@@ -25,7 +26,6 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 args = None
-
 
 def load_model():
     if not os.path.isdir(MODEL_DIR):
@@ -45,25 +45,38 @@ def load_model():
 
 processor, model = load_model()
 
-
-def generate_caption(image: Image.Image) -> str:
+def generate_caption(image: Image.Image, prev_description: str = None) -> str:
     description_line = f" The word '{args.trigger}' must be included accurately in your description."
     if args and args.trigger_description:
         description_line += f" The word '{args.trigger}' refers to {args.trigger_description}."
 
+    intro = (
+        "You are a helpful image captioner that helps reconstruct video scenes."
+    )
+
+    user_prompt = (
+        "This is a frame from a video. Describe it in a formal and highly detailed way. "
+        "Focus on describing people, objects, animals, and background elements. "
+        "Include spatial relationships and relative positions (e.g., left, right, near, far, center). "
+        "Include posture, orientation, or movement if possible. "
+        "Do not mention any visible text. Do not speculate about emotions or narrative. "
+        "Only describe what is visible in the frame."
+    )
+
+    if prev_description:
+        user_prompt = (
+            f"The previous frame was described as follows: '{prev_description}'.\n"
+            f"Now, {user_prompt} Focus on what has changed since the last frame."
+        )
+
+    if args and args.trigger:
+        user_prompt += description_line
+
     convo = [
-        {"role": "system", "content": "You are a helpful image captioner that helps reconstruct video scenes."},
-        {"role": "user", "content": (
-            "Describe this image in a formal and highly detailed way. "
-            "Assume this image is a single frame from a video sequence. "
-            "Focus on describing people, objects, animals, and background elements. "
-            "Include spatial relationships and relative positions (e.g., left, right, near, far, center). "
-            "Include posture, orientation, or movement if possible. "
-            "Do not mention any visible text. Do not speculate about emotions or narrative. "
-            "Only describe what is visible in the image." +
-            (description_line if args and args.trigger else "")
-        )},
+        {"role": "system", "content": intro},
+        {"role": "user", "content": user_prompt},
     ]
+
     prompt = processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[prompt], images=[image], return_tensors="pt").to("cuda")
     inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
@@ -116,7 +129,8 @@ def summarize(captions: list[str]) -> str:
         "Focus on visual changes, movement, positions of people and objects, and continuity. "
         "Do not list steps or number frames. Do not mention any image or caption. "
         "Do not format the result as markdown. Do not say 'image description'. "
-        "Simply describe what is happening in the video as if narrating it to someone. "
+        "Avoid speculating about intentions or emotions. Do not include any metadata or formatting. "
+        "Write as if describing the scene to someone who cannot see it."
     )
     if args and args.trigger:
         summary_prompt += f" The phrase '{args.trigger}' must be included."
@@ -130,7 +144,20 @@ def summarize(captions: list[str]) -> str:
         "prompt": prompt,
         "stream": False
     })
-    result = response.json().get("response", "<No response>").strip().replace("\n", " ")
+
+    if not response.ok:
+        logging.error("LLM response error: %s", response.status_code)
+        return "<No response from model>"
+
+    result_raw = response.json().get("response", "").strip()
+    print(f"\n[Raw LLM Output]\n{result_raw}\n")
+
+    # Strip thinking tags if present
+    result = re.sub(r"<(thinking|think)>.*?</\\1>", "", result_raw, flags=re.IGNORECASE | re.DOTALL).strip().replace("\n", " ")
+
+    if args.trigger:
+        result = f"{args.trigger}. {result}"
+
     print(f"\n[Final Narrative]\n{result}\n")
     return result
 
@@ -157,12 +184,8 @@ def process_video(path: str, interval_sec: float = 1.0):
             fname = os.path.join(tmp, f"frame_{idx:06d}.jpg")
             cv2.imwrite(fname, frame)
             img = Image.open(fname).convert("RGB")
-            caption = generate_caption(img)
-            if prev_caption:
-                delta = f"Compared to the previous frame: {caption}"
-            else:
-                delta = caption
-            captions.append(delta)
+            caption = generate_caption(img, prev_caption)
+            captions.append(caption)
             prev_caption = caption
             with open(os.path.splitext(fname)[0] + ".txt", "w", encoding="utf-8") as f:
                 f.write(caption)
