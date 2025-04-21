@@ -1,1 +1,4 @@
 temp/
+venv/
+input/
+models/
