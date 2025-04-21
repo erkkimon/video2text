@@ -4,9 +4,10 @@ import logging
 import os
 import sys
 import tempfile
-
 import torch
 import cv2
+import requests
+import argparse
 from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoProcessor, LlavaForConditionalGeneration
@@ -23,44 +24,48 @@ MODEL_DIR = "models/llama-joycaption-alpha-two-hf-llava"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-# Download model if missing
-def ensure_model():
+args = None
+
+
+def load_model():
     if not os.path.isdir(MODEL_DIR):
         logging.info("Model missing, downloading %s...", MODEL_NAME)
         os.makedirs(os.path.dirname(MODEL_DIR), exist_ok=True)
         snapshot_download(repo_id=MODEL_NAME, local_dir=MODEL_DIR)
         logging.info("Download complete.")
-
-# Initialize
-ensure_model()
-logging.info("Loading processor and model...")
-processor = AutoProcessor.from_pretrained(MODEL_DIR)
-model = LlavaForConditionalGeneration.from_pretrained(
-    MODEL_DIR, torch_dtype=torch.float16, device_map="auto"
-)
-model.eval()
-logging.info("Model ready.")
+    logging.info("Loading processor and model...")
+    processor = AutoProcessor.from_pretrained(MODEL_DIR)
+    model = LlavaForConditionalGeneration.from_pretrained(
+        MODEL_DIR, torch_dtype=torch.float16, device_map="auto"
+    )
+    model.eval()
+    logging.info("Model ready.")
+    return processor, model
 
 
-def describe_image(path: str, return_caption=False):
-    """
-    Caption a single image and optionally return the text.
-    """
-    if not os.path.isfile(path):
-        logging.error("Image not found: %s", path)
-        return None
+processor, model = load_model()
 
-    img = Image.open(path).convert("RGB")
+
+def generate_caption(image: Image.Image) -> str:
+    description_line = f" The word '{args.trigger}' must be included accurately in your description."
+    if args and args.trigger_description:
+        description_line += f" The word '{args.trigger}' refers to {args.trigger_description}."
+
     convo = [
-        {"role": "system", "content": "You are a helpful image captioner."},
+        {"role": "system", "content": "You are a helpful image captioner that helps reconstruct video scenes."},
         {"role": "user", "content": (
-            "Write a long descriptive caption for this image in a formal tone. "
-            "Include details about lighting and camera angle. "
-            "Do not mention any visible text."
+            "Describe this image in a formal and highly detailed way. "
+            "Assume this image is a single frame from a video sequence. "
+            "Focus on describing people, objects, animals, and background elements. "
+            "Include spatial relationships and relative positions (e.g., left, right, near, far, center). "
+            "Include posture, orientation, or movement if possible. "
+            "Do not mention any visible text. Do not speculate about emotions or narrative. "
+            "Only describe what is visible in the image." +
+            (description_line if args and args.trigger else "")
         )},
     ]
     prompt = processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[prompt], images=[img], return_tensors="pt").to("cuda")
+    inputs = processor(text=[prompt], images=[image], return_tensors="pt").to("cuda")
     inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
 
     with torch.no_grad():
@@ -68,19 +73,27 @@ def describe_image(path: str, return_caption=False):
             **inputs,
             max_new_tokens=300,
             do_sample=True,
-            temperature=0.6,
+            temperature=0.3,
             top_p=0.9,
             use_cache=True
         )[0]
 
     caption_ids = outputs[inputs["input_ids"].shape[1]:]
-    caption = processor.tokenizer.decode(caption_ids, skip_special_tokens=True).strip()
+    return processor.tokenizer.decode(caption_ids, skip_special_tokens=True).strip().replace("\n", " ")
 
+
+def describe_image(path: str, return_caption=False):
+    if not os.path.isfile(path):
+        logging.error("Image not found: %s", path)
+        return None
+
+    img = Image.open(path).convert("RGB")
+    caption = generate_caption(img)
     out_txt = os.path.splitext(path)[0] + ".txt"
     with open(out_txt, "w", encoding="utf-8") as f:
         f.write(caption)
     logging.info("Caption saved: %s", out_txt)
-
+    print(f"[Frame Caption] {caption}\n")
     return caption if return_caption else None
 
 
@@ -93,6 +106,33 @@ def process_folder(folder: str):
     logging.info("Processing %d images in %s", len(files), folder)
     for img in files:
         describe_image(img)
+
+
+def summarize(captions: list[str]) -> str:
+    combined = "\n".join(captions)
+    summary_prompt = (
+        "You are a video scene summarizer. Below is a chronological list of frame-level visual descriptions from a short video. "
+        "Your task is to write a flowing narrative that captures what is happening in the video over time. "
+        "Focus on visual changes, movement, positions of people and objects, and continuity. "
+        "Do not list steps or number frames. Do not mention any image or caption. "
+        "Do not format the result as markdown. Do not say 'image description'. "
+        "Simply describe what is happening in the video as if narrating it to someone. "
+    )
+    if args and args.trigger:
+        summary_prompt += f" The phrase '{args.trigger}' must be included."
+        if args.trigger_description:
+            summary_prompt += f" The phrase '{args.trigger}' refers to {args.trigger_description}."
+
+    prompt = summary_prompt + "\n\n" + combined
+
+    response = requests.post("http://localhost:11434/api/generate", json={
+        "model": args.model,
+        "prompt": prompt,
+        "stream": False
+    })
+    result = response.json().get("response", "<No response>").strip().replace("\n", " ")
+    print(f"\n[Final Narrative]\n{result}\n")
+    return result
 
 
 def process_video(path: str, interval_sec: float = 1.0):
@@ -108,6 +148,7 @@ def process_video(path: str, interval_sec: float = 1.0):
     idx = 0
     tmp = tempfile.mkdtemp(prefix="frames_")
 
+    prev_caption = None
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -115,59 +156,39 @@ def process_video(path: str, interval_sec: float = 1.0):
         if idx % step == 0:
             fname = os.path.join(tmp, f"frame_{idx:06d}.jpg")
             cv2.imwrite(fname, frame)
-            cap_txt = describe_image(fname, return_caption=True)
-            if cap_txt:
-                captions.append(cap_txt)
+            img = Image.open(fname).convert("RGB")
+            caption = generate_caption(img)
+            if prev_caption:
+                delta = f"Compared to the previous frame: {caption}"
+            else:
+                delta = caption
+            captions.append(delta)
+            prev_caption = caption
+            with open(os.path.splitext(fname)[0] + ".txt", "w", encoding="utf-8") as f:
+                f.write(caption)
+            logging.info("Caption saved: %s", fname)
+            print(f"[Frame Caption] {caption}\n")
         idx += 1
     cap.release()
     logging.info("Captured %d frames", len(captions))
 
     summary = summarize(captions)
-    out_sum = os.path.splitext(path)[0] + "_narrative.txt"
+    out_sum = os.path.splitext(path)[0] + ".txt"
     with open(out_sum, "w", encoding="utf-8") as f:
         f.write(summary)
     logging.info("Narrative saved: %s", out_sum)
 
 
-def summarize(captions: list[str]) -> str:
-    numbered = "\n".join([f"{i+1}. {c}" for i, c in enumerate(captions)])
-    user_content = (
-        "Combine these captions into a single, smoothly flowing narrative in a formal tone:\n" + numbered
-    )
-    convo = [
-        {"role": "system", "content": "You write coherent narratives."},
-        {"role": "user", "content": user_content},
-    ]
-    prompt = processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
+def main():
+    global args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input", help="Image, video file or folder")
+    parser.add_argument("--trigger", help="Phrase that must be included in the narrative", default=None)
+    parser.add_argument("--trigger-description", help="Explanation of what the trigger means", default=None)
+    parser.add_argument("--model", help="Ollama model to use", default="huihui_ai/qwq-abliterated:32b")
+    args = parser.parse_args()
 
-    # Use a real RGB dummy image
-    dummy_image = Image.new("RGB", (224, 224), color=(128, 128, 128))
-    inputs = processor(
-        text=[prompt],
-        images=[dummy_image],
-        return_tensors="pt"
-    ).to("cuda")
-    inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=500,
-            do_sample=False,
-            temperature=0.0,
-            use_cache=True,
-        )[0]
-
-    narrative_ids = output_ids[inputs["input_ids"].shape[1]:]
-    return processor.tokenizer.decode(narrative_ids, skip_special_tokens=True).strip()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python video2text_pipeline.py <file_or_folder>")
-        sys.exit(1)
-
-    src = sys.argv[1]
+    src = args.input
     ext = os.path.splitext(src)[1].lower()
     if os.path.isdir(src):
         process_folder(src)
@@ -175,3 +196,7 @@ if __name__ == "__main__":
         process_video(src)
     else:
         describe_image(src)
+
+
+if __name__ == "__main__":
+    main()
